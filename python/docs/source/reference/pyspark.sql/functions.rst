@@ -48,9 +48,11 @@ Conditional Functions
     ifnull
     nanvl
     nullif
+    nullifzero
     nvl
     nvl2
     when
+    zeroifnull
 
 
 Predicate Functions
@@ -142,6 +144,7 @@ Mathematical Functions
     tanh
     try_add
     try_divide
+    try_mod
     try_multiply
     try_subtract
     unhex
@@ -280,6 +283,8 @@ Date and Timestamp Functions
     quarter
     second
     session_window
+    timestamp_add
+    timestamp_diff
     timestamp_micros
     timestamp_millis
     timestamp_seconds
@@ -577,6 +582,7 @@ URL Functions
     parse_url
     url_decode
     url_encode
+    try_url_decode
 
 
 Misc Functions

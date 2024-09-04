@@ -39,8 +39,7 @@ import org.apache.hadoop.yarn.conf.YarnConfiguration
 import org.apache.spark._
 import org.apache.spark.api.r.RUtils
 import org.apache.spark.deploy.rest._
-import org.apache.spark.internal.{Logging, MDC}
-import org.apache.spark.internal.LogKeys
+import org.apache.spark.internal.{LogEntry, Logging, LogKeys, MDC}
 import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.UI._
 import org.apache.spark.launcher.SparkLauncher
@@ -64,6 +63,8 @@ private[deploy] object SparkSubmitAction extends Enumeration {
  */
 private[spark] class SparkSubmit extends Logging {
 
+  override protected def logName: String = classOf[SparkSubmit].getName
+
   import DependencyUtils._
   import SparkSubmit._
 
@@ -84,6 +85,10 @@ private[spark] class SparkSubmit extends Logging {
         Logging.disableStructuredLogging()
       }
     }
+
+    // We should initialize log again after `spark.log.structuredLogging.enabled` effected
+    Logging.uninitialize()
+
     // Initialize logging if it hasn't been done yet. Keep track of whether logging needs to
     // be reset before the application starts.
     val uninitLog = initializeLogIfNecessary(true, silent = true)
@@ -142,12 +147,14 @@ private[spark] class SparkSubmit extends Logging {
    /___/ .__/\_,_/_/ /_/\_\   version %s
       /_/
                         """.format(SPARK_VERSION))
-    logInfo("Using Scala %s, %s, %s".format(
-      Properties.versionString, Properties.javaVmName, Properties.javaVersion))
-    logInfo(s"Branch $SPARK_BRANCH")
-    logInfo(s"Compiled by user $SPARK_BUILD_USER on $SPARK_BUILD_DATE")
-    logInfo(s"Revision $SPARK_REVISION")
-    logInfo(s"Url $SPARK_REPO_URL")
+    logInfo(log"Using Scala ${MDC(LogKeys.SCALA_VERSION, Properties.versionString)}," +
+      log" ${MDC(LogKeys.JAVA_VM_NAME, Properties.javaVmName)}," +
+      log" ${MDC(LogKeys.JAVA_VERSION, Properties.javaVersion)}")
+    logInfo(log"Branch ${MDC(LogKeys.SPARK_BRANCH, SPARK_BRANCH)}")
+    logInfo(log"Compiled by user ${MDC(LogKeys.SPARK_BUILD_USER, SPARK_BUILD_USER)} on" +
+      log" ${MDC(LogKeys.SPARK_BUILD_DATE, SPARK_BUILD_DATE)}")
+    logInfo(log"Revision ${MDC(LogKeys.SPARK_REVISION, SPARK_REVISION)}")
+    logInfo(log"Url ${MDC(LogKeys.SPARK_REPO_URL, SPARK_REPO_URL)}")
     logInfo("Type --help for more information.")
   }
 
@@ -438,7 +445,9 @@ private[spark] class SparkSubmit extends Logging {
                 workingDirectory,
                 if (resolvedUri.getFragment != null) resolvedUri.getFragment else source.getName)
                 .getCanonicalFile
-              logInfo(s"Files $resolvedUri from $source to $dest")
+              logInfo(log"Files ${MDC(LogKeys.URI, resolvedUri)}" +
+                log" from ${MDC(LogKeys.SOURCE_PATH, source)}" +
+                log" to ${MDC(LogKeys.DESTINATION_PATH, dest)}")
               Utils.deleteRecursively(dest)
               if (isArchive) {
                 Utils.unpack(source, dest)
@@ -743,6 +752,8 @@ private[spark] class SparkSubmit extends Logging {
           (clusterManager & opt.clusterManager) != 0) {
         if (opt.clOption != null) { childArgs += opt.clOption += opt.value }
         if (opt.confKey != null) {
+          // Used in SparkConnectClient because Spark Connect client does not have SparkConf.
+          if (opt.confKey == "spark.remote") System.setProperty("spark.remote", opt.value)
           if (opt.mergeFn.isDefined && sparkConf.contains(opt.confKey)) {
             sparkConf.set(opt.confKey, opt.mergeFn.get.apply(sparkConf.get(opt.confKey), opt.value))
           } else {
@@ -921,7 +932,7 @@ private[spark] class SparkSubmit extends Logging {
   private def setRMPrincipal(sparkConf: SparkConf): Unit = {
     val shortUserName = UserGroupInformation.getCurrentUser.getShortUserName
     val key = s"spark.hadoop.${YarnConfiguration.RM_PRINCIPAL}"
-    logInfo(s"Setting ${key} to ${shortUserName}")
+    logInfo(log"Setting ${MDC(LogKeys.KEY, key)} to ${MDC(LogKeys.SHORT_USER_NAME, shortUserName)}")
     sparkConf.set(key, shortUserName)
   }
 
@@ -958,11 +969,12 @@ private[spark] class SparkSubmit extends Logging {
     }
 
     if (args.verbose) {
-      logInfo(s"Main class:\n$childMainClass")
-      logInfo(s"Arguments:\n${childArgs.mkString("\n")}")
+      logInfo(log"Main class:\n${MDC(LogKeys.CLASS_NAME, childMainClass)}")
+      logInfo(log"Arguments:\n${MDC(LogKeys.ARGS, childArgs.mkString("\n"))}")
       // sysProps may contain sensitive information, so redact before printing
-      logInfo(s"Spark config:\n${Utils.redact(sparkConf.getAll.toMap).sorted.mkString("\n")}")
-      logInfo(s"Classpath elements:\n${childClasspath.mkString("\n")}")
+      logInfo(log"Spark config:\n" +
+      log"${MDC(LogKeys.CONFIG, Utils.redact(sparkConf.getAll.toMap).sorted.mkString("\n"))}")
+      logInfo(log"Classpath elements:\n${MDC(LogKeys.CLASS_PATHS, childClasspath.mkString("\n"))}")
       logInfo("\n")
     }
     assert(!(args.deployMode == "cluster" && args.proxyUser != null && childClasspath.nonEmpty) ||
@@ -982,10 +994,10 @@ private[spark] class SparkSubmit extends Logging {
       case e: ClassNotFoundException =>
         logError(log"Failed to load class ${MDC(LogKeys.CLASS_NAME, childMainClass)}.")
         if (childMainClass.contains("thriftserver")) {
-          logInfo(s"Failed to load main class $childMainClass.")
+          logInfo(log"Failed to load main class ${MDC(LogKeys.CLASS_NAME, childMainClass)}.")
           logInfo("You need to build Spark with -Phive and -Phive-thriftserver.")
         } else if (childMainClass.contains("org.apache.spark.sql.connect")) {
-          logInfo(s"Failed to load main class $childMainClass.")
+          logInfo(log"Failed to load main class ${MDC(LogKeys.CLASS_NAME, childMainClass)}.")
           // TODO(SPARK-42375): Should point out the user-facing page here instead.
           logInfo("You need to specify Spark Connect jars with --jars or --packages.")
         }
@@ -993,7 +1005,7 @@ private[spark] class SparkSubmit extends Logging {
       case e: NoClassDefFoundError =>
         logError(log"Failed to load ${MDC(LogKeys.CLASS_NAME, childMainClass)}", e)
         if (e.getMessage.contains("org/apache/hadoop/hive")) {
-          logInfo(s"Failed to load hive class.")
+          logInfo("Failed to load hive class.")
           logInfo("You need to build Spark with -Phive and -Phive-thriftserver.")
         }
         throw new SparkUserAppException(CLASS_NOT_FOUND_EXIT_STATUS)
@@ -1069,6 +1081,7 @@ object SparkSubmit extends CommandLineUtils with Logging {
   private val SPARK_SHELL = "spark-shell"
   private val PYSPARK_SHELL = "pyspark-shell"
   private val SPARKR_SHELL = "sparkr-shell"
+  private val CONNECT_SHELL = "connect-shell"
   private val SPARKR_PACKAGE_ARCHIVE = "sparkr.zip"
   private val R_PACKAGE_ARCHIVE = "rpkg.zip"
 
@@ -1092,17 +1105,31 @@ object SparkSubmit extends CommandLineUtils with Logging {
         new SparkSubmitArguments(args.toImmutableArraySeq) {
           override protected def logInfo(msg: => String): Unit = self.logInfo(msg)
 
+          override protected def logInfo(entry: LogEntry): Unit = self.logInfo(entry)
+
           override protected def logWarning(msg: => String): Unit = self.logWarning(msg)
 
+          override protected def logWarning(entry: LogEntry): Unit = self.logWarning(entry)
+
           override protected def logError(msg: => String): Unit = self.logError(msg)
+
+          override protected def logError(entry: LogEntry): Unit = self.logError(entry)
         }
       }
 
       override protected def logInfo(msg: => String): Unit = printMessage(msg)
 
+      override protected def logInfo(entry: LogEntry): Unit = printMessage(entry.message)
+
       override protected def logWarning(msg: => String): Unit = printMessage(s"Warning: $msg")
 
+      override protected def logWarning(entry: LogEntry): Unit =
+        printMessage(s"Warning: ${entry.message}")
+
       override protected def logError(msg: => String): Unit = printMessage(s"Error: $msg")
+
+      override protected def logError(entry: LogEntry): Unit =
+        printMessage(s"Error: ${entry.message}")
 
       override def doSubmit(args: Array[String]): Unit = {
         try {
@@ -1129,7 +1156,7 @@ object SparkSubmit extends CommandLineUtils with Logging {
    * Return whether the given primary resource represents a shell.
    */
   private[deploy] def isShell(res: String): Boolean = {
-    (res == SPARK_SHELL || res == PYSPARK_SHELL || res == SPARKR_SHELL)
+    (res == SPARK_SHELL || res == PYSPARK_SHELL || res == SPARKR_SHELL || res == CONNECT_SHELL)
   }
 
   /**

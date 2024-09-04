@@ -18,7 +18,7 @@
 package org.apache.spark.sql.execution.datasources.json
 
 import java.io._
-import java.nio.charset.{Charset, StandardCharsets, UnsupportedCharsetException}
+import java.nio.charset.{Charset, StandardCharsets}
 import java.nio.file.Files
 import java.sql.{Date, Timestamp}
 import java.time.{Duration, Instant, LocalDate, LocalDateTime, Period, ZoneId}
@@ -32,13 +32,15 @@ import org.apache.hadoop.io.SequenceFile.CompressionType
 import org.apache.hadoop.io.compress.GzipCodec
 
 import org.apache.spark.{SparkConf, SparkException, SparkRuntimeException, SparkUpgradeException, TestUtils}
+import org.apache.spark.SparkIllegalArgumentException
 import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.{SparkListener, SparkListenerJobEnd}
 import org.apache.spark.sql.{functions => F, _}
 import org.apache.spark.sql.catalyst.json._
-import org.apache.spark.sql.catalyst.util.{DateTimeTestUtils, DateTimeUtils, HadoopCompressionCodec}
+import org.apache.spark.sql.catalyst.util.{CharsetProvider, DateTimeTestUtils, DateTimeUtils, HadoopCompressionCodec}
 import org.apache.spark.sql.catalyst.util.HadoopCompressionCodec.GZIP
 import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLType
+import org.apache.spark.sql.errors.QueryExecutionErrors.toSQLId
 import org.apache.spark.sql.execution.ExternalRDD
 import org.apache.spark.sql.execution.datasources.{CommonFileDataSourceSuite, DataSource, InMemoryFileIndex, NoopCache}
 import org.apache.spark.sql.execution.datasources.v2.json.JsonScanBuilder
@@ -1770,6 +1772,39 @@ abstract class JsonSuite
     }
   }
 
+  test("Write timestamps correctly in ISO8601 format by default") {
+    val customSchema = new StructType(Array(StructField("date", TimestampType, true)))
+    withTempDir { dir =>
+      // lets set LA timezone as for old dates LA had seconds offset
+      withSQLConf("spark.sql.session.timeZone" -> "America/Los_Angeles") {
+        // With dateFormat option.
+        val timestampsWithoutFormatPath = s"${dir.getCanonicalPath}/timestampsWithoutFormat.json"
+        val timestampsWithoutFormat = spark.read
+          .schema(customSchema)
+          .option("timestampFormat", "dd/MM/yyyy HH:mm[XXX]")
+          .json(datesRecords.union(oldDatesRecord))
+
+        timestampsWithoutFormat.write
+          .format("json")
+          .save(timestampsWithoutFormatPath)
+
+        // This will load back the timestamps as string.
+        val stringSchema = StructType(StructField("date", StringType, true) :: Nil)
+        val stringTimestampsWithFormat = spark.read
+          .schema(stringSchema)
+          .json(timestampsWithoutFormatPath)
+        val expectedStringDatesWithoutFormat = Seq(
+          Row("1800-01-01T10:07:02.000-07:52:58"),
+          Row("1885-01-01T10:30:00.000-08:00"),
+          Row("2014-10-27T18:30:00.000-07:00"),
+          Row("2015-08-26T18:00:00.000-07:00"),
+          Row("2016-01-28T20:00:00.000-08:00"))
+
+        checkAnswer(stringTimestampsWithFormat, expectedStringDatesWithoutFormat)
+      }
+    }
+  }
+
   test("Write timestamps correctly with timestampFormat option") {
     val customSchema = new StructType(Array(StructField("date", TimestampType, true)))
     withTempDir { dir =>
@@ -1924,10 +1959,10 @@ abstract class JsonSuite
         val e = intercept[SparkException] {
           spark.read.json(inputFile.toURI.toString).collect()
         }
-        checkError(
+        checkErrorMatchPVals(
           exception = e,
           errorClass = "FAILED_READ_FILE.NO_HINT",
-          parameters = Map("path" -> inputFile.toPath.toUri.toString))
+          parameters = Map("path" -> s".*${inputFile.getName}.*"))
         assert(e.getCause.isInstanceOf[EOFException])
         assert(e.getCause.getMessage === "Unexpected end of input stream")
         val e2 = intercept[SparkException] {
@@ -2174,7 +2209,7 @@ abstract class JsonSuite
         exception = intercept[AnalysisException] {
           spark.read.schema(schema).json(path).select("_corrupt_record").collect()
         },
-        errorClass = "_LEGACY_ERROR_TEMP_1285",
+        errorClass = "UNSUPPORTED_FEATURE.QUERY_ONLY_CORRUPT_RECORD_COLUMN",
         parameters = Map.empty
       )
 
@@ -2335,14 +2370,20 @@ abstract class JsonSuite
 
   test("SPARK-23723: Unsupported encoding name") {
     val invalidCharset = "UTF-128"
-    val exception = intercept[UnsupportedCharsetException] {
-      spark.read
-        .options(Map("encoding" -> invalidCharset, "lineSep" -> "\n"))
-        .json(testFile("test-data/utf16LE.json"))
-        .count()
-    }
-
-    assert(exception.getMessage.contains(invalidCharset))
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        spark.read
+          .options(Map("encoding" -> invalidCharset, "lineSep" -> "\n"))
+          .json(testFile("test-data/utf16LE.json"))
+          .count()
+      },
+      errorClass = "INVALID_PARAMETER_VALUE.CHARSET",
+      parameters = Map(
+        "charset" -> invalidCharset,
+        "functionName" -> toSQLId("JSONOptionsInRead"),
+        "parameter" -> toSQLId("charset"),
+        "charsets" -> CharsetProvider.VALID_CHARSETS.mkString(", "))
+    )
   }
 
   test("SPARK-23723: checking that the encoding option is case agnostic") {
@@ -2393,17 +2434,19 @@ abstract class JsonSuite
   }
 
   test("SPARK-23723: save json in UTF-32BE") {
-    val encoding = "UTF-32BE"
-    withTempPath { path =>
-      val df = spark.createDataset(Seq(("Dog", 42)))
-      df.write
-        .options(Map("encoding" -> encoding))
-        .json(path.getCanonicalPath)
+    withSQLConf(SQLConf.LEGACY_JAVA_CHARSETS.key -> "true") {
+      val encoding = "UTF-32BE"
+      withTempPath { path =>
+        val df = spark.createDataset(Seq(("Dog", 42)))
+        df.write
+          .options(Map("encoding" -> encoding))
+          .json(path.getCanonicalPath)
 
-      checkEncoding(
-        expectedEncoding = encoding,
-        pathToJsonFiles = path.getCanonicalPath,
-        expectedContent = """{"_1":"Dog","_2":42}""")
+        checkEncoding(
+          expectedEncoding = encoding,
+          pathToJsonFiles = path.getCanonicalPath,
+          expectedContent = """{"_1":"Dog","_2":42}""")
+      }
     }
   }
 
@@ -2421,22 +2464,22 @@ abstract class JsonSuite
 
   test("SPARK-23723: wrong output encoding") {
     val encoding = "UTF-128"
-    val exception = intercept[SparkException] {
-      withTempPath { path =>
-        val df = spark.createDataset(Seq((0)))
-        df.write
-          .options(Map("encoding" -> encoding))
-          .json(path.getCanonicalPath)
-      }
-    }
-
-    val baos = new ByteArrayOutputStream()
-    val ps = new PrintStream(baos, true, StandardCharsets.UTF_8.name())
-    exception.printStackTrace(ps)
-    ps.flush()
-
-    assert(baos.toString.contains(
-      "java.nio.charset.UnsupportedCharsetException: UTF-128"))
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        withTempPath { path =>
+          val df = spark.createDataset(Seq((0)))
+          df.write
+            .options(Map("encoding" -> encoding))
+            .json(path.getCanonicalPath)
+        }
+      },
+      errorClass = "INVALID_PARAMETER_VALUE.CHARSET",
+      parameters = Map(
+        "charset" -> encoding,
+        "functionName" -> toSQLId("JSONOptions"),
+        "parameter" -> toSQLId("charset"),
+        "charsets" -> CharsetProvider.VALID_CHARSETS.mkString(", "))
+    )
   }
 
   test("SPARK-23723: read back json in UTF-16LE") {
@@ -2483,16 +2526,18 @@ abstract class JsonSuite
         val os = new FileOutputStream(path)
         os.write(data)
         os.close()
-        val reader = if (inferSchema) {
-          spark.read
-        } else {
-          spark.read.schema(schema)
+        withSQLConf(SQLConf.LEGACY_JAVA_CHARSETS.key -> "true") {
+          val reader = if (inferSchema) {
+            spark.read
+          } else {
+            spark.read.schema(schema)
+          }
+          val readBack = reader
+            .option("encoding", encoding)
+            .option("lineSep", lineSep)
+            .json(path.getCanonicalPath)
+          checkAnswer(readBack, records.map(rec => Row(rec._1, rec._2)))
         }
-        val readBack = reader
-          .option("encoding", encoding)
-          .option("lineSep", lineSep)
-          .json(path.getCanonicalPath)
-        checkAnswer(readBack, records.map(rec => Row(rec._1, rec._2)))
       }
     }
   }
@@ -3039,14 +3084,13 @@ abstract class JsonSuite
     val exp = spark.sql("select timestamp_ntz'2020-12-12 12:12:12' as col0")
     for (pattern <- patterns) {
       withTempPath { path =>
-        val actualPath = path.toPath.toUri.toURL.toString
         val err = intercept[SparkException] {
           exp.write.option("timestampNTZFormat", pattern).json(path.getAbsolutePath)
         }
         checkErrorMatchPVals(
           exception = err,
           errorClass = "TASK_WRITE_FAILED",
-          parameters = Map("path" -> s"$actualPath.*"))
+          parameters = Map("path" -> s".*${path.getName}.*"))
 
         val msg = err.getCause.getMessage
         assert(
@@ -3728,7 +3772,7 @@ abstract class JsonSuite
   }
 
   test("SPARK-40667: validate JSON Options") {
-    assert(JSONOptions.getAllOptions.size == 29)
+    assert(JSONOptions.getAllOptions.size == 30)
     // Please add validation on any new Json options here
     assert(JSONOptions.isValidOption("samplingRatio"))
     assert(JSONOptions.isValidOption("primitivesAsString"))
@@ -3757,6 +3801,7 @@ abstract class JsonSuite
     assert(JSONOptions.isValidOption("timeZone"))
     assert(JSONOptions.isValidOption("writeNonAsciiCharacterAsCodePoint"))
     assert(JSONOptions.isValidOption("singleVariantColumn"))
+    assert(JSONOptions.isValidOption("useUnsafeRow"))
     assert(JSONOptions.isValidOption("encoding"))
     assert(JSONOptions.isValidOption("charset"))
     // Please add validation on any new Json options with alternative here
@@ -3969,8 +4014,17 @@ class JsonV2Suite extends JsonSuite {
 }
 
 class JsonLegacyTimeParserSuite extends JsonSuite {
+
+  override def excluded: Seq[String] =
+    Seq("Write timestamps correctly in ISO8601 format by default")
+
   override protected def sparkConf: SparkConf =
     super
       .sparkConf
       .set(SQLConf.LEGACY_TIME_PARSER_POLICY, "legacy")
+}
+
+class JsonUnsafeRowSuite extends JsonSuite {
+  override protected def sparkConf: SparkConf =
+    super.sparkConf.set(SQLConf.JSON_USE_UNSAFE_ROW, true)
 }

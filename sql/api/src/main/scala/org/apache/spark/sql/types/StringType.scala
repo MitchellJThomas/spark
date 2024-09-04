@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.types
 
+import org.json4s.JsonAST.{JString, JValue}
+
 import org.apache.spark.annotation.Stable
 import org.apache.spark.sql.catalyst.util.CollationFactory
 
@@ -34,14 +36,17 @@ class StringType private(val collationId: Int) extends AtomicType with Serializa
    * non-binary. If this field is true, byte level operations can be used against this datatype
    * (e.g. for equality and hashing).
    */
-  def supportsBinaryEquality: Boolean =
+  private[sql] def supportsBinaryEquality: Boolean =
     CollationFactory.fetchCollation(collationId).supportsBinaryEquality
 
-  def isUTF8BinaryCollation: Boolean =
+  private[sql] def supportsLowercaseEquality: Boolean =
+    CollationFactory.fetchCollation(collationId).supportsLowercaseEquality
+
+  private[sql] def isUTF8BinaryCollation: Boolean =
     collationId == CollationFactory.UTF8_BINARY_COLLATION_ID
 
-  def isUTF8BinaryLcaseCollation: Boolean =
-    collationId == CollationFactory.UTF8_BINARY_LCASE_COLLATION_ID
+  private[sql] def isUTF8LcaseCollation: Boolean =
+    collationId == CollationFactory.UTF8_LCASE_COLLATION_ID
 
   /**
    * Support for Binary Ordering implies that strings are considered equal only
@@ -50,7 +55,7 @@ class StringType private(val collationId: Int) extends AtomicType with Serializa
    * it follows spark internal implementation. If this field is true, byte level operations
    * can be used against this datatype (e.g. for equality, hashing and ordering).
    */
-  def supportsBinaryOrdering: Boolean =
+  private[sql] def supportsBinaryOrdering: Boolean =
     CollationFactory.fetchCollation(collationId).supportsBinaryOrdering
 
   /**
@@ -60,6 +65,11 @@ class StringType private(val collationId: Int) extends AtomicType with Serializa
   override def typeName: String =
     if (isUTF8BinaryCollation) "string"
     else s"string collate ${CollationFactory.fetchCollation(collationId).collationName}"
+
+  // Due to backwards compatibility and compatibility with other readers
+  // all string types are serialized in json as regular strings and
+  // the collation information is written to struct field metadata
+  override def jsonValue: JValue = JString("string")
 
   override def equals(obj: Any): Boolean =
     obj.isInstanceOf[StringType] && obj.asInstanceOf[StringType].collationId == collationId

@@ -96,7 +96,37 @@ object MimaExcludes {
     ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.api.python.WriteInputFormatTestDataGenerator"),
     ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.api.python.WriteInputFormatTestDataGenerator$"),
     // SPARK-47764: Cleanup shuffle dependencies based on ShuffleCleanupMode
-    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.shuffle.MigratableResolver.addShuffleToSkip")
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.shuffle.MigratableResolver.addShuffleToSkip"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.SQLContext#implicits._sqlContext"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.SQLImplicits._sqlContext"),
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.sql.SQLImplicits.session"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.SparkSession#implicits._sqlContext"),
+    // SPARK-48761: Add clusterBy() to CreateTableWriter.
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.sql.CreateTableWriter.clusterBy"),
+    // SPARK-48900: Add `reason` string to all job / stage / job group cancellation calls
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.scheduler.JobWaiter.cancel"),
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.FutureAction.cancel"),
+    // SPARK-48901: Add clusterBy() to DataStreamWriter.
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.sql.DataStreamWriter.clusterBy"),
+    // SPARK-49027: A shared Column API
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.ColumnName"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.TypedColumn"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.functions"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.functions$"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.expressions.Aggregator"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.expressions.MutableAggregationBuffer"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.expressions.UserDefinedAggregateFunction"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.expressions.UserDefinedFunction"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.expressions.Window"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.expressions.Window$"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.expressions.WindowSpec"),
+
+    // SPARK-49423: Consolidate Observation in sql/api
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.Observation"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.Observation$"),
+
+    // SPARK-49425: Create a shared DataFrameWriter interface.
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.DataFrameWriter")
   )
 
   // Default exclude rules

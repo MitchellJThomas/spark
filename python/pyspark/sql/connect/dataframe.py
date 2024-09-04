@@ -16,7 +16,6 @@
 #
 
 # mypy: disable-error-code="override"
-
 from pyspark.errors.exceptions.base import (
     SessionNotSameException,
     PySparkIndexError,
@@ -43,13 +42,14 @@ from typing import (
     Type,
 )
 
+import copy
 import sys
 import random
 import pyarrow as pa
 import json
 import warnings
 from collections.abc import Iterable
-from functools import cached_property
+import functools
 
 from pyspark import _NoValue
 from pyspark._globals import _NoValueType
@@ -73,6 +73,7 @@ from pyspark.storagelevel import StorageLevel
 import pyspark.sql.connect.plan as plan
 from pyspark.sql.connect.conversion import ArrowTableToRowsConversion
 from pyspark.sql.connect.group import GroupedData
+from pyspark.sql.connect.merge import MergeIntoWriter
 from pyspark.sql.connect.readwriter import DataFrameWriter, DataFrameWriterV2
 from pyspark.sql.connect.streaming.readwriter import DataStreamWriter
 from pyspark.sql.column import Column
@@ -82,7 +83,7 @@ from pyspark.sql.connect.expressions import (
     UnresolvedStar,
 )
 from pyspark.sql.connect.functions import builtin as F
-from pyspark.sql.pandas.types import from_arrow_schema
+from pyspark.sql.pandas.types import from_arrow_schema, to_arrow_schema
 from pyspark.sql.pandas.functions import _validate_pandas_udf  # type: ignore[attr-defined]
 
 
@@ -101,6 +102,7 @@ if TYPE_CHECKING:
     from pyspark.sql.connect.observation import Observation
     from pyspark.sql.connect.session import SparkSession
     from pyspark.pandas.frame import DataFrame as PandasOnSparkDataFrame
+    from pyspark.sql.metrics import ExecutionInfo
 
 
 class DataFrame(ParentDataFrame):
@@ -122,21 +124,22 @@ class DataFrame(ParentDataFrame):
         self._plan = plan
         if self._plan is None:
             raise PySparkRuntimeError(
-                error_class="MISSING_VALID_PLAN",
-                message_parameters={"operator": "__init__"},
+                errorClass="MISSING_VALID_PLAN",
+                messageParameters={"operator": "__init__"},
             )
 
         self._session: "SparkSession" = session  # type: ignore[assignment]
         if self._session is None:
             raise PySparkRuntimeError(
-                error_class="NO_ACTIVE_SESSION",
-                message_parameters={"operator": "__init__"},
+                errorClass="NO_ACTIVE_SESSION",
+                messageParameters={"operator": "__init__"},
             )
 
         # Check whether _repr_html is supported or not, we use it to avoid calling RPC twice
         # by __repr__ and _repr_html_ while eager evaluation opens.
         self._support_repr_html = False
         self._cached_schema: Optional[StructType] = None
+        self._execution_info: Optional["ExecutionInfo"] = None
 
     def __reduce__(self) -> Tuple:
         """
@@ -206,8 +209,12 @@ class DataFrame(ParentDataFrame):
 
     @property
     def write(self) -> "DataFrameWriter":
-        return DataFrameWriter(self._plan, self._session)
+        def cb(qe: "ExecutionInfo") -> None:
+            self._execution_info = qe
 
+        return DataFrameWriter(self._plan, self._session, cb)
+
+    @functools.cache
     def isEmpty(self) -> bool:
         return len(self.select().take(1)) == 0
 
@@ -222,6 +229,11 @@ class DataFrame(ParentDataFrame):
     def select(self, *cols: "ColumnOrName") -> ParentDataFrame:  # type: ignore[misc]
         if len(cols) == 1 and isinstance(cols[0], list):
             cols = cols[0]
+        if any(not isinstance(c, (str, Column)) for c in cols):
+            raise PySparkTypeError(
+                errorClass="NOT_LIST_OF_COLUMN_OR_STR",
+                messageParameters={"arg_name": "columns"},
+            )
         return DataFrame(
             plan.Project(self._plan, [F._to_col(c) for c in cols]),
             session=self._session,
@@ -242,8 +254,8 @@ class DataFrame(ParentDataFrame):
     def agg(self, *exprs: Union[Column, Dict[str, str]]) -> ParentDataFrame:
         if not exprs:
             raise PySparkValueError(
-                error_class="CANNOT_BE_EMPTY",
-                message_parameters={"item": "exprs"},
+                errorClass="CANNOT_BE_EMPTY",
+                messageParameters={"item": "exprs"},
             )
 
         if len(exprs) == 1 and isinstance(exprs[0], dict):
@@ -256,15 +268,17 @@ class DataFrame(ParentDataFrame):
             return self.groupBy().agg(*exprs)
 
     def alias(self, alias: str) -> ParentDataFrame:
-        return DataFrame(plan.SubqueryAlias(self._plan, alias), session=self._session)
+        res = DataFrame(plan.SubqueryAlias(self._plan, alias), session=self._session)
+        res._cached_schema = self._cached_schema
+        return res
 
     def colRegex(self, colName: str) -> Column:
         from pyspark.sql.connect.column import Column as ConnectColumn
 
         if not isinstance(colName, str):
             raise PySparkTypeError(
-                error_class="NOT_STR",
-                message_parameters={"arg_name": "colName", "arg_type": type(colName).__name__},
+                errorClass="NOT_STR",
+                messageParameters={"arg_name": "colName", "arg_type": type(colName).__name__},
             )
         return ConnectColumn(UnresolvedRegex(colName, self._plan._plan_id))
 
@@ -298,20 +312,22 @@ class DataFrame(ParentDataFrame):
     def _check_same_session(self, other: ParentDataFrame) -> None:
         if self._session.session_id != other._session.session_id:  # type: ignore[attr-defined]
             raise SessionNotSameException(
-                error_class="SESSION_NOT_SAME",
-                message_parameters={},
+                errorClass="SESSION_NOT_SAME",
+                messageParameters={},
             )
 
     def coalesce(self, numPartitions: int) -> ParentDataFrame:
         if not numPartitions > 0:
             raise PySparkValueError(
-                error_class="VALUE_NOT_POSITIVE",
-                message_parameters={"arg_name": "numPartitions", "arg_value": str(numPartitions)},
+                errorClass="VALUE_NOT_POSITIVE",
+                messageParameters={"arg_name": "numPartitions", "arg_value": str(numPartitions)},
             )
-        return DataFrame(
+        res = DataFrame(
             plan.Repartition(self._plan, num_partitions=numPartitions, shuffle=False),
             self._session,
         )
+        res._cached_schema = self._cached_schema
+        return res
 
     @overload
     def repartition(self, numPartitions: int, *cols: "ColumnOrName") -> ParentDataFrame:
@@ -327,19 +343,19 @@ class DataFrame(ParentDataFrame):
         if isinstance(numPartitions, int):
             if not numPartitions > 0:
                 raise PySparkValueError(
-                    error_class="VALUE_NOT_POSITIVE",
-                    message_parameters={
+                    errorClass="VALUE_NOT_POSITIVE",
+                    messageParameters={
                         "arg_name": "numPartitions",
                         "arg_value": str(numPartitions),
                     },
                 )
             if len(cols) == 0:
-                return DataFrame(
+                res = DataFrame(
                     plan.Repartition(self._plan, numPartitions, shuffle=True),
                     self._session,
                 )
             else:
-                return DataFrame(
+                res = DataFrame(
                     plan.RepartitionByExpression(
                         self._plan, numPartitions, [F._to_col(c) for c in cols]
                     ),
@@ -347,18 +363,21 @@ class DataFrame(ParentDataFrame):
                 )
         elif isinstance(numPartitions, (str, Column)):
             cols = (numPartitions,) + cols
-            return DataFrame(
+            res = DataFrame(
                 plan.RepartitionByExpression(self._plan, None, [F._to_col(c) for c in cols]),
                 self.sparkSession,
             )
         else:
             raise PySparkTypeError(
-                error_class="NOT_COLUMN_OR_STR",
-                message_parameters={
+                errorClass="NOT_COLUMN_OR_STR",
+                messageParameters={
                     "arg_name": "numPartitions",
                     "arg_type": type(numPartitions).__name__,
                 },
             )
+
+        res._cached_schema = self._cached_schema
+        return res
 
     @overload
     def repartitionByRange(self, numPartitions: int, *cols: "ColumnOrName") -> ParentDataFrame:
@@ -374,26 +393,26 @@ class DataFrame(ParentDataFrame):
         if isinstance(numPartitions, int):
             if not numPartitions > 0:
                 raise PySparkValueError(
-                    error_class="VALUE_NOT_POSITIVE",
-                    message_parameters={
+                    errorClass="VALUE_NOT_POSITIVE",
+                    messageParameters={
                         "arg_name": "numPartitions",
                         "arg_value": str(numPartitions),
                     },
                 )
             if len(cols) == 0:
                 raise PySparkValueError(
-                    error_class="CANNOT_BE_EMPTY",
-                    message_parameters={"item": "cols"},
+                    errorClass="CANNOT_BE_EMPTY",
+                    messageParameters={"item": "cols"},
                 )
             else:
-                return DataFrame(
+                res = DataFrame(
                     plan.RepartitionByExpression(
                         self._plan, numPartitions, [F._sort_col(c) for c in cols]
                     ),
                     self.sparkSession,
                 )
         elif isinstance(numPartitions, (str, Column)):
-            return DataFrame(
+            res = DataFrame(
                 plan.RepartitionByExpression(
                     self._plan, None, [F._sort_col(c) for c in [numPartitions] + list(cols)]
                 ),
@@ -401,36 +420,47 @@ class DataFrame(ParentDataFrame):
             )
         else:
             raise PySparkTypeError(
-                error_class="NOT_COLUMN_OR_INT_OR_STR",
-                message_parameters={
+                errorClass="NOT_COLUMN_OR_INT_OR_STR",
+                messageParameters={
                     "arg_name": "numPartitions",
                     "arg_type": type(numPartitions).__name__,
                 },
             )
+        res._cached_schema = self._cached_schema
+        return res
 
     def dropDuplicates(self, subset: Optional[List[str]] = None) -> ParentDataFrame:
         if subset is not None and not isinstance(subset, (list, tuple)):
             raise PySparkTypeError(
-                error_class="NOT_LIST_OR_TUPLE",
-                message_parameters={"arg_name": "subset", "arg_type": type(subset).__name__},
+                errorClass="NOT_LIST_OR_TUPLE",
+                messageParameters={"arg_name": "subset", "arg_type": type(subset).__name__},
             )
 
         if subset is None:
-            return DataFrame(
+            res = DataFrame(
                 plan.Deduplicate(child=self._plan, all_columns_as_keys=True), session=self._session
             )
         else:
-            return DataFrame(
+            for c in subset:
+                if not isinstance(c, str):
+                    raise PySparkTypeError(
+                        errorClass="NOT_STR",
+                        messageParameters={"arg_name": "subset", "arg_type": type(c).__name__},
+                    )
+            res = DataFrame(
                 plan.Deduplicate(child=self._plan, column_names=subset), session=self._session
             )
+
+        res._cached_schema = self._cached_schema
+        return res
 
     drop_duplicates = dropDuplicates
 
     def dropDuplicatesWithinWatermark(self, subset: Optional[List[str]] = None) -> ParentDataFrame:
         if subset is not None and not isinstance(subset, (list, tuple)):
             raise PySparkTypeError(
-                error_class="NOT_LIST_OR_TUPLE",
-                message_parameters={"arg_name": "subset", "arg_type": type(subset).__name__},
+                errorClass="NOT_LIST_OR_TUPLE",
+                messageParameters={"arg_name": "subset", "arg_type": type(subset).__name__},
             )
 
         if subset is None:
@@ -439,15 +469,23 @@ class DataFrame(ParentDataFrame):
                 session=self._session,
             )
         else:
+            for c in subset:
+                if not isinstance(c, str):
+                    raise PySparkTypeError(
+                        errorClass="NOT_STR",
+                        messageParameters={"arg_name": "subset", "arg_type": type(c).__name__},
+                    )
             return DataFrame(
                 plan.Deduplicate(child=self._plan, column_names=subset, within_watermark=True),
                 session=self._session,
             )
 
     def distinct(self) -> ParentDataFrame:
-        return DataFrame(
+        res = DataFrame(
             plan.Deduplicate(child=self._plan, all_columns_as_keys=True), session=self._session
         )
+        res._cached_schema = self._cached_schema
+        return res
 
     @overload
     def drop(self, cols: "ColumnOrName") -> ParentDataFrame:
@@ -461,8 +499,8 @@ class DataFrame(ParentDataFrame):
         _cols = list(cols)
         if any(not isinstance(c, (str, Column)) for c in _cols):
             raise PySparkTypeError(
-                error_class="NOT_COLUMN_OR_STR",
-                message_parameters={"arg_name": "cols", "arg_type": type(cols).__name__},
+                errorClass="NOT_COLUMN_OR_STR",
+                messageParameters={"arg_name": "cols", "arg_type": type(cols).__name__},
             )
 
         return DataFrame(
@@ -478,7 +516,9 @@ class DataFrame(ParentDataFrame):
             expr = F.expr(condition)
         else:
             expr = condition
-        return DataFrame(plan.Filter(child=self._plan, filter=expr), session=self._session)
+        res = DataFrame(plan.Filter(child=self._plan, filter=expr), session=self._session)
+        res._cached_schema = self._cached_schema
+        return res
 
     def first(self) -> Optional[Row]:
         return self.head()
@@ -504,14 +544,14 @@ class DataFrame(ParentDataFrame):
             elif isinstance(c, int) and not isinstance(c, bool):
                 if c < 1:
                     raise PySparkIndexError(
-                        error_class="INDEX_NOT_POSITIVE", message_parameters={"index": str(c)}
+                        errorClass="INDEX_NOT_POSITIVE", messageParameters={"index": str(c)}
                     )
                 # ordinal is 1-based
                 _cols.append(self[c - 1])
             else:
                 raise PySparkTypeError(
-                    error_class="NOT_COLUMN_OR_STR",
-                    message_parameters={"arg_name": "cols", "arg_type": type(c).__name__},
+                    errorClass="NOT_COLUMN_OR_STR",
+                    messageParameters={"arg_name": "cols", "arg_type": type(c).__name__},
                 )
 
         return GroupedData(df=self, group_type="groupby", grouping_cols=_cols)
@@ -536,14 +576,14 @@ class DataFrame(ParentDataFrame):
             elif isinstance(c, int) and not isinstance(c, bool):
                 if c < 1:
                     raise PySparkIndexError(
-                        error_class="INDEX_NOT_POSITIVE", message_parameters={"index": str(c)}
+                        errorClass="INDEX_NOT_POSITIVE", messageParameters={"index": str(c)}
                     )
                 # ordinal is 1-based
                 _cols.append(self[c - 1])
             else:
                 raise PySparkTypeError(
-                    error_class="NOT_COLUMN_OR_STR",
-                    message_parameters={"arg_name": "cols", "arg_type": type(c).__name__},
+                    errorClass="NOT_COLUMN_OR_STR",
+                    messageParameters={"arg_name": "cols", "arg_type": type(c).__name__},
                 )
 
         return GroupedData(df=self, group_type="rollup", grouping_cols=_cols)
@@ -566,14 +606,14 @@ class DataFrame(ParentDataFrame):
             elif isinstance(c, int) and not isinstance(c, bool):
                 if c < 1:
                     raise PySparkIndexError(
-                        error_class="INDEX_NOT_POSITIVE", message_parameters={"index": str(c)}
+                        errorClass="INDEX_NOT_POSITIVE", messageParameters={"index": str(c)}
                     )
                 # ordinal is 1-based
                 _cols.append(self[c - 1])
             else:
                 raise PySparkTypeError(
-                    error_class="NOT_COLUMN_OR_STR",
-                    message_parameters={"arg_name": "cols", "arg_type": type(c).__name__},
+                    errorClass="NOT_COLUMN_OR_STR",
+                    messageParameters={"arg_name": "cols", "arg_type": type(c).__name__},
                 )
 
         return GroupedData(df=self, group_type="cube", grouping_cols=_cols)
@@ -591,8 +631,8 @@ class DataFrame(ParentDataFrame):
                     gset.append(self[c])
                 else:
                     raise PySparkTypeError(
-                        error_class="NOT_COLUMN_OR_STR",
-                        message_parameters={
+                        errorClass="NOT_COLUMN_OR_STR",
+                        messageParameters={
                             "arg_name": "groupingSets",
                             "arg_type": type(c).__name__,
                         },
@@ -607,8 +647,8 @@ class DataFrame(ParentDataFrame):
                 gcols.append(self[c])
             else:
                 raise PySparkTypeError(
-                    error_class="NOT_COLUMN_OR_STR",
-                    message_parameters={"arg_name": "cols", "arg_type": type(c).__name__},
+                    errorClass="NOT_COLUMN_OR_STR",
+                    messageParameters={"arg_name": "cols", "arg_type": type(c).__name__},
                 )
 
         return GroupedData(
@@ -688,7 +728,9 @@ class DataFrame(ParentDataFrame):
         )
 
     def limit(self, n: int) -> ParentDataFrame:
-        return DataFrame(plan.Limit(child=self._plan, limit=n), session=self._session)
+        res = DataFrame(plan.Limit(child=self._plan, limit=n), session=self._session)
+        res._cached_schema = self._cached_schema
+        return res
 
     def tail(self, num: int) -> List[Row]:
         return DataFrame(plan.Tail(child=self._plan, limit=num), session=self._session).collect()
@@ -701,8 +743,8 @@ class DataFrame(ParentDataFrame):
         """Return a JVM Seq of Columns that describes the sort order"""
         if cols is None:
             raise PySparkValueError(
-                error_class="CANNOT_BE_EMPTY",
-                message_parameters={"item": "cols"},
+                errorClass="CANNOT_BE_EMPTY",
+                messageParameters={"item": "cols"},
             )
 
         if len(cols) == 1 and isinstance(cols[0], list):
@@ -719,8 +761,8 @@ class DataFrame(ParentDataFrame):
                     _c = self[-c - 1].desc()
                 else:
                     raise PySparkIndexError(
-                        error_class="ZERO_INDEX",
-                        message_parameters={},
+                        errorClass="ZERO_INDEX",
+                        messageParameters={},
                     )
             else:
                 _c = c  # type: ignore[assignment]
@@ -734,8 +776,8 @@ class DataFrame(ParentDataFrame):
             _cols = [c if asc else c.desc() for asc, c in zip(ascending, _cols)]
         else:
             raise PySparkTypeError(
-                error_class="NOT_BOOL_OR_LIST",
-                message_parameters={"arg_name": "ascending", "arg_type": type(ascending).__name__},
+                errorClass="NOT_BOOL_OR_LIST",
+                messageParameters={"arg_name": "ascending", "arg_type": type(ascending).__name__},
             )
 
         return [F._sort_col(c) for c in _cols]
@@ -745,7 +787,7 @@ class DataFrame(ParentDataFrame):
         *cols: Union[int, str, Column, List[Union[int, str, Column]]],
         **kwargs: Any,
     ) -> ParentDataFrame:
-        return DataFrame(
+        res = DataFrame(
             plan.Sort(
                 self._plan,
                 columns=self._sort_cols(cols, kwargs),
@@ -753,6 +795,8 @@ class DataFrame(ParentDataFrame):
             ),
             session=self._session,
         )
+        res._cached_schema = self._cached_schema
+        return res
 
     orderBy = sort
 
@@ -761,7 +805,7 @@ class DataFrame(ParentDataFrame):
         *cols: Union[int, str, Column, List[Union[int, str, Column]]],
         **kwargs: Any,
     ) -> ParentDataFrame:
-        return DataFrame(
+        res = DataFrame(
             plan.Sort(
                 self._plan,
                 columns=self._sort_cols(cols, kwargs),
@@ -769,6 +813,8 @@ class DataFrame(ParentDataFrame):
             ),
             session=self._session,
         )
+        res._cached_schema = self._cached_schema
+        return res
 
     def sample(
         self,
@@ -797,8 +843,8 @@ class DataFrame(ParentDataFrame):
         ):
             argtypes = [type(arg).__name__ for arg in [withReplacement, fraction, seed]]
             raise PySparkTypeError(
-                error_class="NOT_BOOL_OR_FLOAT_OR_INT",
-                message_parameters={
+                errorClass="NOT_BOOL_OR_FLOAT_OR_INT",
+                messageParameters={
                     "arg_name": "withReplacement (optional), "
                     + "fraction (required) and seed (optional)",
                     "arg_type": ", ".join(argtypes),
@@ -816,7 +862,7 @@ class DataFrame(ParentDataFrame):
 
         seed = int(seed) if seed is not None else random.randint(0, sys.maxsize)
 
-        return DataFrame(
+        res = DataFrame(
             plan.Sample(
                 child=self._plan,
                 lower_bound=0.0,
@@ -826,6 +872,8 @@ class DataFrame(ParentDataFrame):
             ),
             session=self._session,
         )
+        res._cached_schema = self._cached_schema
+        return res
 
     def withColumnRenamed(self, existing: str, new: str) -> ParentDataFrame:
         return self.withColumnsRenamed({existing: new})
@@ -833,8 +881,8 @@ class DataFrame(ParentDataFrame):
     def withColumnsRenamed(self, colsMap: Dict[str, str]) -> ParentDataFrame:
         if not isinstance(colsMap, dict):
             raise PySparkTypeError(
-                error_class="NOT_DICT",
-                message_parameters={"arg_name": "colsMap", "arg_type": type(colsMap).__name__},
+                errorClass="NOT_DICT",
+                messageParameters={"arg_name": "colsMap", "arg_type": type(colsMap).__name__},
             )
 
         return DataFrame(plan.WithColumnsRenamed(self._plan, colsMap), self._session)
@@ -844,13 +892,13 @@ class DataFrame(ParentDataFrame):
     ) -> str:
         if not isinstance(n, int) or isinstance(n, bool):
             raise PySparkTypeError(
-                error_class="NOT_INT",
-                message_parameters={"arg_name": "n", "arg_type": type(n).__name__},
+                errorClass="NOT_INT",
+                messageParameters={"arg_name": "n", "arg_type": type(n).__name__},
             )
         if not isinstance(vertical, bool):
             raise PySparkTypeError(
-                error_class="NOT_BOOL",
-                message_parameters={"arg_name": "vertical", "arg_type": type(vertical).__name__},
+                errorClass="NOT_BOOL",
+                messageParameters={"arg_name": "vertical", "arg_type": type(vertical).__name__},
             )
 
         _truncate: int = -1
@@ -861,8 +909,8 @@ class DataFrame(ParentDataFrame):
                 _truncate = int(truncate)
             except ValueError:
                 raise PySparkTypeError(
-                    error_class="NOT_BOOL",
-                    message_parameters={
+                    errorClass="NOT_BOOL",
+                    messageParameters={
                         "arg_name": "truncate",
                         "arg_type": type(truncate).__name__,
                     },
@@ -882,8 +930,8 @@ class DataFrame(ParentDataFrame):
     def withColumns(self, colsMap: Dict[str, Column]) -> ParentDataFrame:
         if not isinstance(colsMap, dict):
             raise PySparkTypeError(
-                error_class="NOT_DICT",
-                message_parameters={"arg_name": "colsMap", "arg_type": type(colsMap).__name__},
+                errorClass="NOT_DICT",
+                messageParameters={"arg_name": "colsMap", "arg_type": type(colsMap).__name__},
             )
 
         names: List[str] = []
@@ -904,8 +952,8 @@ class DataFrame(ParentDataFrame):
     def withColumn(self, colName: str, col: Column) -> ParentDataFrame:
         if not isinstance(col, Column):
             raise PySparkTypeError(
-                error_class="NOT_COLUMN",
-                message_parameters={"arg_name": "col", "arg_type": type(col).__name__},
+                errorClass="NOT_COLUMN",
+                messageParameters={"arg_name": "col", "arg_type": type(col).__name__},
             )
         return DataFrame(
             plan.WithColumns(
@@ -919,8 +967,8 @@ class DataFrame(ParentDataFrame):
     def withMetadata(self, columnName: str, metadata: Dict[str, Any]) -> ParentDataFrame:
         if not isinstance(metadata, dict):
             raise PySparkTypeError(
-                error_class="NOT_DICT",
-                message_parameters={"arg_name": "metadata", "arg_type": type(metadata).__name__},
+                errorClass="NOT_DICT",
+                messageParameters={"arg_name": "metadata", "arg_type": type(metadata).__name__},
             )
 
         return DataFrame(
@@ -969,13 +1017,13 @@ class DataFrame(ParentDataFrame):
         # TODO: reuse error handling code in sql.DataFrame.withWatermark()
         if not eventTime or type(eventTime) is not str:
             raise PySparkTypeError(
-                error_class="NOT_STR",
-                message_parameters={"arg_name": "eventTime", "arg_type": type(eventTime).__name__},
+                errorClass="NOT_STR",
+                messageParameters={"arg_name": "eventTime", "arg_type": type(eventTime).__name__},
             )
         if not delayThreshold or type(delayThreshold) is not str:
             raise PySparkTypeError(
-                error_class="NOT_STR",
-                message_parameters={
+                errorClass="NOT_STR",
+                messageParameters={
                     "arg_name": "delayThreshold",
                     "arg_type": type(delayThreshold).__name__,
                 },
@@ -998,8 +1046,8 @@ class DataFrame(ParentDataFrame):
 
         if not isinstance(name, str):
             raise PySparkTypeError(
-                error_class="NOT_STR",
-                message_parameters={"arg_name": "name", "arg_type": type(name).__name__},
+                errorClass="NOT_STR",
+                messageParameters={"arg_name": "name", "arg_type": type(name).__name__},
             )
 
         allowed_types = (str, float, int, Column, list)
@@ -1011,8 +1059,8 @@ class DataFrame(ParentDataFrame):
         for p in parameters:
             if not isinstance(p, allowed_types):
                 raise PySparkTypeError(
-                    error_class="INVALID_ITEM_FOR_CONTAINER",
-                    message_parameters={
+                    errorClass="INVALID_ITEM_FOR_CONTAINER",
+                    messageParameters={
                         "arg_name": "parameters",
                         "allowed_types": allowed_types_repr,
                         "item_type": type(p).__name__,
@@ -1021,18 +1069,20 @@ class DataFrame(ParentDataFrame):
             if isinstance(p, list):
                 if not all(isinstance(e, allowed_primitive_types) for e in p):
                     raise PySparkTypeError(
-                        error_class="INVALID_ITEM_FOR_CONTAINER",
-                        message_parameters={
+                        errorClass="INVALID_ITEM_FOR_CONTAINER",
+                        messageParameters={
                             "arg_name": "parameters",
                             "allowed_types": allowed_types_repr,
                             "item_type": type(p).__name__ + "[" + type(p[0]).__name__ + "]",
                         },
                     )
 
-        return DataFrame(
+        res = DataFrame(
             plan.Hint(self._plan, name, [F.lit(p) for p in list(parameters)]),
             session=self._session,
         )
+        res._cached_schema = self._cached_schema
+        return res
 
     def randomSplit(
         self,
@@ -1042,15 +1092,15 @@ class DataFrame(ParentDataFrame):
         for w in weights:
             if w < 0.0:
                 raise PySparkValueError(
-                    error_class="VALUE_NOT_POSITIVE",
-                    message_parameters={"arg_name": "weights", "arg_value": str(w)},
+                    errorClass="VALUE_NOT_POSITIVE",
+                    messageParameters={"arg_name": "weights", "arg_value": str(w)},
                 )
         seed = seed if seed is not None else random.randint(0, sys.maxsize)
         total = sum(weights)
         if total <= 0:
             raise PySparkValueError(
-                error_class="VALUE_NOT_POSITIVE",
-                message_parameters={"arg_name": "sum(weights)", "arg_value": str(total)},
+                errorClass="VALUE_NOT_POSITIVE",
+                messageParameters={"arg_name": "sum(weights)", "arg_value": str(total)},
             )
         proportions = list(map(lambda x: x / total, weights))
         normalizedCumWeights = [0.0]
@@ -1073,6 +1123,7 @@ class DataFrame(ParentDataFrame):
                 ),
                 session=self._session,
             )
+            samplePlan._cached_schema = self._cached_schema
             splits.append(samplePlan)
             j += 1
 
@@ -1087,33 +1138,43 @@ class DataFrame(ParentDataFrame):
 
         if len(exprs) == 0:
             raise PySparkValueError(
-                error_class="CANNOT_BE_EMPTY",
-                message_parameters={"item": "exprs"},
+                errorClass="CANNOT_BE_EMPTY",
+                messageParameters={"item": "exprs"},
             )
         if not all(isinstance(c, Column) for c in exprs):
             raise PySparkTypeError(
-                error_class="NOT_LIST_OF_COLUMN",
-                message_parameters={"arg_name": "exprs"},
+                errorClass="NOT_LIST_OF_COLUMN",
+                messageParameters={"arg_name": "exprs"},
             )
 
         if isinstance(observation, Observation):
-            return observation._on(self, *exprs)
+            res = observation._on(self, *exprs)
         elif isinstance(observation, str):
-            return DataFrame(
+            res = DataFrame(
                 plan.CollectMetrics(self._plan, observation, list(exprs)),
                 self._session,
             )
         else:
             raise PySparkTypeError(
-                error_class="NOT_OBSERVATION_OR_STR",
-                message_parameters={
+                errorClass="NOT_OBSERVATION_OR_STR",
+                messageParameters={
                     "arg_name": "observation",
                     "arg_type": type(observation).__name__,
                 },
             )
 
+        res._cached_schema = self._cached_schema
+        return res
+
     def show(self, n: int = 20, truncate: Union[bool, int] = True, vertical: bool = False) -> None:
         print(self._show_string(n, truncate, vertical))
+
+    def _merge_cached_schema(self, other: ParentDataFrame) -> Optional[StructType]:
+        # to avoid type coercion, only propagate the schema
+        # when the cached schemas are exactly the same
+        if self._cached_schema is not None and self._cached_schema == other._cached_schema:
+            return self.schema
+        return None
 
     def union(self, other: ParentDataFrame) -> ParentDataFrame:
         self._check_same_session(other)
@@ -1121,18 +1182,20 @@ class DataFrame(ParentDataFrame):
 
     def unionAll(self, other: ParentDataFrame) -> ParentDataFrame:
         self._check_same_session(other)
-        return DataFrame(
+        res = DataFrame(
             plan.SetOperation(
                 self._plan, other._plan, "union", is_all=True  # type: ignore[arg-type]
             ),
             session=self._session,
         )
+        res._cached_schema = self._merge_cached_schema(other)
+        return res
 
     def unionByName(
         self, other: ParentDataFrame, allowMissingColumns: bool = False
     ) -> ParentDataFrame:
         self._check_same_session(other)
-        return DataFrame(
+        res = DataFrame(
             plan.SetOperation(
                 self._plan,
                 other._plan,  # type: ignore[arg-type]
@@ -1142,48 +1205,58 @@ class DataFrame(ParentDataFrame):
             ),
             session=self._session,
         )
+        res._cached_schema = self._merge_cached_schema(other)
+        return res
 
     def subtract(self, other: ParentDataFrame) -> ParentDataFrame:
         self._check_same_session(other)
-        return DataFrame(
+        res = DataFrame(
             plan.SetOperation(
                 self._plan, other._plan, "except", is_all=False  # type: ignore[arg-type]
             ),
             session=self._session,
         )
+        res._cached_schema = self._merge_cached_schema(other)
+        return res
 
     def exceptAll(self, other: ParentDataFrame) -> ParentDataFrame:
         self._check_same_session(other)
-        return DataFrame(
+        res = DataFrame(
             plan.SetOperation(
                 self._plan, other._plan, "except", is_all=True  # type: ignore[arg-type]
             ),
             session=self._session,
         )
+        res._cached_schema = self._merge_cached_schema(other)
+        return res
 
     def intersect(self, other: ParentDataFrame) -> ParentDataFrame:
         self._check_same_session(other)
-        return DataFrame(
+        res = DataFrame(
             plan.SetOperation(
                 self._plan, other._plan, "intersect", is_all=False  # type: ignore[arg-type]
             ),
             session=self._session,
         )
+        res._cached_schema = self._merge_cached_schema(other)
+        return res
 
     def intersectAll(self, other: ParentDataFrame) -> ParentDataFrame:
         self._check_same_session(other)
-        return DataFrame(
+        res = DataFrame(
             plan.SetOperation(
                 self._plan, other._plan, "intersect", is_all=True  # type: ignore[arg-type]
             ),
             session=self._session,
         )
+        res._cached_schema = self._merge_cached_schema(other)
+        return res
 
     def where(self, condition: Union[Column, str]) -> ParentDataFrame:
         if not isinstance(condition, (str, Column)):
             raise PySparkTypeError(
-                error_class="NOT_COLUMN_OR_STR",
-                message_parameters={"arg_name": "condition", "arg_type": type(condition).__name__},
+                errorClass="NOT_COLUMN_OR_STR",
+                messageParameters={"arg_name": "condition", "arg_type": type(condition).__name__},
             )
         return self.filter(condition)
 
@@ -1198,28 +1271,28 @@ class DataFrame(ParentDataFrame):
     ) -> ParentDataFrame:
         if not isinstance(value, (float, int, str, bool, dict)):
             raise PySparkTypeError(
-                error_class="NOT_BOOL_OR_DICT_OR_FLOAT_OR_INT_OR_STR",
-                message_parameters={"arg_name": "value", "arg_type": type(value).__name__},
+                errorClass="NOT_BOOL_OR_DICT_OR_FLOAT_OR_INT_OR_STR",
+                messageParameters={"arg_name": "value", "arg_type": type(value).__name__},
             )
         if isinstance(value, dict):
             if len(value) == 0:
                 raise PySparkValueError(
-                    error_class="CANNOT_BE_EMPTY",
-                    message_parameters={"item": "value"},
+                    errorClass="CANNOT_BE_EMPTY",
+                    messageParameters={"item": "value"},
                 )
             for c, v in value.items():
                 if not isinstance(c, str):
                     raise PySparkTypeError(
-                        error_class="NOT_STR",
-                        message_parameters={
+                        errorClass="NOT_STR",
+                        messageParameters={
                             "arg_name": "key type of dict",
                             "arg_type": type(c).__name__,
                         },
                     )
                 if not isinstance(v, (bool, int, float, str)):
                     raise PySparkTypeError(
-                        error_class="NOT_BOOL_OR_FLOAT_OR_INT_OR_STR",
-                        message_parameters={
+                        errorClass="NOT_BOOL_OR_FLOAT_OR_INT_OR_STR",
+                        messageParameters={
                             "arg_name": "value type of dict",
                             "arg_type": type(v).__name__,
                         },
@@ -1233,14 +1306,14 @@ class DataFrame(ParentDataFrame):
                 for c in subset:
                     if not isinstance(c, str):
                         raise PySparkTypeError(
-                            error_class="NOT_LIST_OR_STR_OR_TUPLE",
-                            message_parameters={"arg_name": "cols", "arg_type": type(c).__name__},
+                            errorClass="NOT_LIST_OR_STR_OR_TUPLE",
+                            messageParameters={"arg_name": "cols", "arg_type": type(c).__name__},
                         )
                 _cols = list(subset)
             else:
                 raise PySparkTypeError(
-                    error_class="NOT_LIST_OR_TUPLE",
-                    message_parameters={"arg_name": "subset", "arg_type": type(subset).__name__},
+                    errorClass="NOT_LIST_OR_TUPLE",
+                    messageParameters={"arg_name": "subset", "arg_type": type(subset).__name__},
                 )
 
         if isinstance(value, dict):
@@ -1265,8 +1338,8 @@ class DataFrame(ParentDataFrame):
         if how is not None:
             if not isinstance(how, str):
                 raise PySparkTypeError(
-                    error_class="NOT_STR",
-                    message_parameters={"arg_name": "how", "arg_type": type(how).__name__},
+                    errorClass="NOT_STR",
+                    messageParameters={"arg_name": "how", "arg_type": type(how).__name__},
                 )
             if how == "all":
                 min_non_nulls = 1
@@ -1274,15 +1347,15 @@ class DataFrame(ParentDataFrame):
                 min_non_nulls = None
             else:
                 raise PySparkValueError(
-                    error_class="CANNOT_BE_EMPTY",
-                    message_parameters={"arg_name": "how", "arg_value": str(how)},
+                    errorClass="CANNOT_BE_EMPTY",
+                    messageParameters={"arg_name": "how", "arg_value": str(how)},
                 )
 
         if thresh is not None:
             if not isinstance(thresh, int):
                 raise PySparkTypeError(
-                    error_class="NOT_INT",
-                    message_parameters={"arg_name": "thresh", "arg_type": type(thresh).__name__},
+                    errorClass="NOT_INT",
+                    messageParameters={"arg_name": "thresh", "arg_type": type(thresh).__name__},
                 )
 
             # 'thresh' overwrites 'how'
@@ -1296,14 +1369,14 @@ class DataFrame(ParentDataFrame):
                 for c in subset:
                     if not isinstance(c, str):
                         raise PySparkTypeError(
-                            error_class="NOT_LIST_OR_STR_OR_TUPLE",
-                            message_parameters={"arg_name": "cols", "arg_type": type(c).__name__},
+                            errorClass="NOT_LIST_OR_STR_OR_TUPLE",
+                            messageParameters={"arg_name": "cols", "arg_type": type(c).__name__},
                         )
                 _cols = list(subset)
             else:
                 raise PySparkTypeError(
-                    error_class="NOT_LIST_OR_STR_OR_TUPLE",
-                    message_parameters={"arg_name": "subset", "arg_type": type(subset).__name__},
+                    errorClass="NOT_LIST_OR_STR_OR_TUPLE",
+                    messageParameters={"arg_name": "subset", "arg_type": type(subset).__name__},
                 )
 
         return DataFrame(
@@ -1326,8 +1399,8 @@ class DataFrame(ParentDataFrame):
                 value = None
             else:
                 raise PySparkTypeError(
-                    error_class="ARGUMENT_REQUIRED",
-                    message_parameters={"arg_name": "value", "condition": "`to_replace` is dict"},
+                    errorClass="ARGUMENT_REQUIRED",
+                    messageParameters={"arg_name": "value", "condition": "`to_replace` is dict"},
                 )
 
         # Helper functions
@@ -1354,8 +1427,8 @@ class DataFrame(ParentDataFrame):
         valid_types = (bool, float, int, str, list, tuple)
         if not isinstance(to_replace, valid_types + (dict,)):
             raise PySparkTypeError(
-                error_class="NOT_BOOL_OR_DICT_OR_FLOAT_OR_INT_OR_LIST_OR_STR_OR_TUPLE",
-                message_parameters={
+                errorClass="NOT_BOOL_OR_DICT_OR_FLOAT_OR_INT_OR_LIST_OR_STR_OR_TUPLE",
+                messageParameters={
                     "arg_name": "to_replace",
                     "arg_type": type(to_replace).__name__,
                 },
@@ -1367,15 +1440,15 @@ class DataFrame(ParentDataFrame):
             and not isinstance(to_replace, dict)
         ):
             raise PySparkTypeError(
-                error_class="NOT_BOOL_OR_FLOAT_OR_INT_OR_LIST_OR_NONE_OR_STR_OR_TUPLE",
-                message_parameters={"arg_name": "value", "arg_type": type(value).__name__},
+                errorClass="NOT_BOOL_OR_FLOAT_OR_INT_OR_LIST_OR_NONE_OR_STR_OR_TUPLE",
+                messageParameters={"arg_name": "value", "arg_type": type(value).__name__},
             )
 
         if isinstance(to_replace, (list, tuple)) and isinstance(value, (list, tuple)):
             if len(to_replace) != len(value):
                 raise PySparkValueError(
-                    error_class="LENGTH_SHOULD_BE_THE_SAME",
-                    message_parameters={
+                    errorClass="LENGTH_SHOULD_BE_THE_SAME",
+                    messageParameters={
                         "arg1": "to_replace",
                         "arg2": "value",
                         "arg1_length": str(len(to_replace)),
@@ -1385,8 +1458,8 @@ class DataFrame(ParentDataFrame):
 
         if not (subset is None or isinstance(subset, (list, tuple, str))):
             raise PySparkTypeError(
-                error_class="NOT_LIST_OR_STR_OR_TUPLE",
-                message_parameters={"arg_name": "subset", "arg_type": type(subset).__name__},
+                errorClass="NOT_LIST_OR_STR_OR_TUPLE",
+                messageParameters={"arg_name": "subset", "arg_type": type(subset).__name__},
             )
 
         # Reshape input arguments if necessary
@@ -1412,8 +1485,8 @@ class DataFrame(ParentDataFrame):
             for all_of_type in [all_of_bool, all_of_str, all_of_numeric]
         ):
             raise PySparkValueError(
-                error_class="MIXED_TYPE_REPLACEMENT",
-                message_parameters={},
+                errorClass="MIXED_TYPE_REPLACEMENT",
+                messageParameters={},
             )
 
         def _convert_int_to_float(v: Any) -> Any:
@@ -1447,8 +1520,8 @@ class DataFrame(ParentDataFrame):
         for s in _statistics:
             if not isinstance(s, str):
                 raise PySparkTypeError(
-                    error_class="NOT_LIST_OF_STR",
-                    message_parameters={"arg_name": "statistics", "arg_type": type(s).__name__},
+                    errorClass="NOT_LIST_OF_STR",
+                    messageParameters={"arg_name": "statistics", "arg_type": type(s).__name__},
                 )
         return DataFrame(
             plan.StatSummary(child=self._plan, statistics=_statistics),
@@ -1473,13 +1546,13 @@ class DataFrame(ParentDataFrame):
     def cov(self, col1: str, col2: str) -> float:
         if not isinstance(col1, str):
             raise PySparkTypeError(
-                error_class="NOT_STR",
-                message_parameters={"arg_name": "col1", "arg_type": type(col1).__name__},
+                errorClass="NOT_STR",
+                messageParameters={"arg_name": "col1", "arg_type": type(col1).__name__},
             )
         if not isinstance(col2, str):
             raise PySparkTypeError(
-                error_class="NOT_STR",
-                message_parameters={"arg_name": "col2", "arg_type": type(col2).__name__},
+                errorClass="NOT_STR",
+                messageParameters={"arg_name": "col2", "arg_type": type(col2).__name__},
             )
         table, _ = DataFrame(
             plan.StatCov(child=self._plan, col1=col1, col2=col2),
@@ -1490,20 +1563,20 @@ class DataFrame(ParentDataFrame):
     def corr(self, col1: str, col2: str, method: Optional[str] = None) -> float:
         if not isinstance(col1, str):
             raise PySparkTypeError(
-                error_class="NOT_STR",
-                message_parameters={"arg_name": "col1", "arg_type": type(col1).__name__},
+                errorClass="NOT_STR",
+                messageParameters={"arg_name": "col1", "arg_type": type(col1).__name__},
             )
         if not isinstance(col2, str):
             raise PySparkTypeError(
-                error_class="NOT_STR",
-                message_parameters={"arg_name": "col2", "arg_type": type(col2).__name__},
+                errorClass="NOT_STR",
+                messageParameters={"arg_name": "col2", "arg_type": type(col2).__name__},
             )
         if not method:
             method = "pearson"
         if not method == "pearson":
             raise PySparkValueError(
-                error_class="VALUE_NOT_PEARSON",
-                message_parameters={"arg_name": "method", "arg_value": method},
+                errorClass="VALUE_NOT_PEARSON",
+                messageParameters={"arg_name": "method", "arg_value": method},
             )
         table, _ = DataFrame(
             plan.StatCorr(child=self._plan, col1=col1, col2=col2, method=method),
@@ -1519,8 +1592,8 @@ class DataFrame(ParentDataFrame):
     ) -> Union[List[float], List[List[float]]]:
         if not isinstance(col, (str, list, tuple)):
             raise PySparkTypeError(
-                error_class="NOT_LIST_OR_STR_OR_TUPLE",
-                message_parameters={"arg_name": "col", "arg_type": type(col).__name__},
+                errorClass="NOT_LIST_OR_STR_OR_TUPLE",
+                messageParameters={"arg_name": "col", "arg_type": type(col).__name__},
             )
 
         isStr = isinstance(col, str)
@@ -1533,14 +1606,14 @@ class DataFrame(ParentDataFrame):
         for c in col:
             if not isinstance(c, str):
                 raise PySparkTypeError(
-                    error_class="NOT_LIST_OF_STR",
-                    message_parameters={"arg_name": "columns", "arg_type": type(c).__name__},
+                    errorClass="NOT_LIST_OF_STR",
+                    messageParameters={"arg_name": "columns", "arg_type": type(c).__name__},
                 )
 
         if not isinstance(probabilities, (list, tuple)):
             raise PySparkTypeError(
-                error_class="NOT_LIST_OR_TUPLE",
-                message_parameters={
+                errorClass="NOT_LIST_OR_TUPLE",
+                messageParameters={
                     "arg_name": "probabilities",
                     "arg_type": type(probabilities).__name__,
                 },
@@ -1550,8 +1623,8 @@ class DataFrame(ParentDataFrame):
         for p in probabilities:
             if not isinstance(p, (float, int)) or p < 0 or p > 1:
                 raise PySparkTypeError(
-                    error_class="NOT_LIST_OF_FLOAT_OR_INT",
-                    message_parameters={
+                    errorClass="NOT_LIST_OF_FLOAT_OR_INT",
+                    messageParameters={
                         "arg_name": "probabilities",
                         "arg_type": type(p).__name__,
                     },
@@ -1559,16 +1632,16 @@ class DataFrame(ParentDataFrame):
 
         if not isinstance(relativeError, (float, int)):
             raise PySparkTypeError(
-                error_class="NOT_FLOAT_OR_INT",
-                message_parameters={
+                errorClass="NOT_FLOAT_OR_INT",
+                messageParameters={
                     "arg_name": "relativeError",
                     "arg_type": type(relativeError).__name__,
                 },
             )
         if relativeError < 0:
             raise PySparkValueError(
-                error_class="NEGATIVE_VALUE",
-                message_parameters={
+                errorClass="NEGATIVE_VALUE",
+                messageParameters={
                     "arg_name": "relativeError",
                     "arg_value": str(relativeError),
                 },
@@ -1590,13 +1663,13 @@ class DataFrame(ParentDataFrame):
     def crosstab(self, col1: str, col2: str) -> ParentDataFrame:
         if not isinstance(col1, str):
             raise PySparkTypeError(
-                error_class="NOT_STR",
-                message_parameters={"arg_name": "col1", "arg_type": type(col1).__name__},
+                errorClass="NOT_STR",
+                messageParameters={"arg_name": "col1", "arg_type": type(col1).__name__},
             )
         if not isinstance(col2, str):
             raise PySparkTypeError(
-                error_class="NOT_STR",
-                message_parameters={"arg_name": "col2", "arg_type": type(col2).__name__},
+                errorClass="NOT_STR",
+                messageParameters={"arg_name": "col2", "arg_type": type(col2).__name__},
             )
         return DataFrame(
             plan.StatCrosstab(child=self._plan, col1=col1, col2=col2),
@@ -1610,8 +1683,8 @@ class DataFrame(ParentDataFrame):
             cols = list(cols)
         if not isinstance(cols, list):
             raise PySparkTypeError(
-                error_class="NOT_LIST_OR_TUPLE",
-                message_parameters={"arg_name": "cols", "arg_type": type(cols).__name__},
+                errorClass="NOT_LIST_OR_TUPLE",
+                messageParameters={"arg_name": "cols", "arg_type": type(cols).__name__},
             )
         if not support:
             support = 0.01
@@ -1625,21 +1698,21 @@ class DataFrame(ParentDataFrame):
     ) -> ParentDataFrame:
         if not isinstance(col, (str, Column)):
             raise PySparkTypeError(
-                error_class="NOT_COLUMN_OR_STR",
-                message_parameters={"arg_name": "col", "arg_type": type(col).__name__},
+                errorClass="NOT_COLUMN_OR_STR",
+                messageParameters={"arg_name": "col", "arg_type": type(col).__name__},
             )
         if not isinstance(fractions, dict):
             raise PySparkTypeError(
-                error_class="NOT_DICT",
-                message_parameters={"arg_name": "fractions", "arg_type": type(fractions).__name__},
+                errorClass="NOT_DICT",
+                messageParameters={"arg_name": "fractions", "arg_type": type(fractions).__name__},
             )
 
         _fractions = []
         for k, v in fractions.items():
             if not isinstance(k, (float, int, str)):
                 raise PySparkTypeError(
-                    error_class="DISALLOWED_TYPE_FOR_CONTAINER",
-                    message_parameters={
+                    errorClass="DISALLOWED_TYPE_FOR_CONTAINER",
+                    messageParameters={
                         "arg_name": "fractions",
                         "arg_type": type(fractions).__name__,
                         "allowed_types": "float, int, str",
@@ -1678,12 +1751,12 @@ class DataFrame(ParentDataFrame):
     def __getattr__(self, name: str) -> "Column":
         if name in ["_jseq", "_jdf", "_jmap", "_jcols", "rdd", "toJSON"]:
             raise PySparkAttributeError(
-                error_class="JVM_ATTRIBUTE_NOT_SUPPORTED", message_parameters={"attr_name": name}
+                errorClass="JVM_ATTRIBUTE_NOT_SUPPORTED", messageParameters={"attr_name": name}
             )
 
         if name not in self.columns:
             raise PySparkAttributeError(
-                error_class="ATTRIBUTE_NOT_SUPPORTED", message_parameters={"attr_name": name}
+                errorClass="ATTRIBUTE_NOT_SUPPORTED", messageParameters={"attr_name": name}
             )
 
         return self._col(name)
@@ -1735,8 +1808,8 @@ class DataFrame(ParentDataFrame):
             return F.col(self.columns[item])
         else:
             raise PySparkTypeError(
-                error_class="NOT_COLUMN_OR_INT_OR_LIST_OR_STR_OR_TUPLE",
-                message_parameters={"arg_name": "item", "arg_type": type(item).__name__},
+                errorClass="NOT_COLUMN_OR_INT_OR_LIST_OR_STR_OR_TUPLE",
+                messageParameters={"arg_name": "item", "arg_type": type(item).__name__},
             )
 
     def _col(self, name: str) -> Column:
@@ -1757,7 +1830,10 @@ class DataFrame(ParentDataFrame):
     def collect(self) -> List[Row]:
         table, schema = self._to_table()
 
-        schema = schema or from_arrow_schema(table.schema, prefer_timestamp_ntz=True)
+        # not all datatypes are supported in arrow based collect
+        # here always verify the schema by from_arrow_schema
+        schema2 = from_arrow_schema(table.schema, prefer_timestamp_ntz=True)
+        schema = schema or schema2
 
         assert schema is not None and isinstance(schema, StructType)
 
@@ -1765,17 +1841,22 @@ class DataFrame(ParentDataFrame):
 
     def _to_table(self) -> Tuple["pa.Table", Optional[StructType]]:
         query = self._plan.to_proto(self._session.client)
-        table, schema = self._session.client.to_table(query, self._plan.observations)
+        table, schema, self._execution_info = self._session.client.to_table(
+            query, self._plan.observations
+        )
         assert table is not None
         return (table, schema)
 
     def toArrow(self) -> "pa.Table":
+        schema = to_arrow_schema(self.schema, error_on_duplicated_field_names_in_struct=True)
         table, _ = self._to_table()
-        return table
+        return table.cast(schema)
 
     def toPandas(self) -> "PandasDataFrameLike":
         query = self._plan.to_proto(self._session.client)
-        return self._session.client.to_pandas(query, self._plan.observations)
+        pdf, ei = self._session.client.to_pandas(query, self._plan.observations)
+        self._execution_info = ei
+        return pdf
 
     @property
     def schema(self) -> StructType:
@@ -1787,32 +1868,29 @@ class DataFrame(ParentDataFrame):
         if self._cached_schema is None:
             query = self._plan.to_proto(self._session.client)
             self._cached_schema = self._session.client.schema(query)
-        return self._cached_schema
+        return copy.deepcopy(self._cached_schema)
 
+    @functools.cache
     def isLocal(self) -> bool:
         query = self._plan.to_proto(self._session.client)
         result = self._session.client._analyze(method="is_local", plan=query).is_local
         assert result is not None
         return result
 
-    @cached_property
+    @functools.cached_property
     def isStreaming(self) -> bool:
         query = self._plan.to_proto(self._session.client)
         result = self._session.client._analyze(method="is_streaming", plan=query).is_streaming
         assert result is not None
         return result
 
-    def _tree_string(self, level: Optional[int] = None) -> str:
-        query = self._plan.to_proto(self._session.client)
-        result = self._session.client._analyze(
-            method="tree_string", plan=query, level=level
-        ).tree_string
-        assert result is not None
-        return result
-
     def printSchema(self, level: Optional[int] = None) -> None:
-        print(self._tree_string(level))
+        if level:
+            print(self.schema.treeString(level))
+        else:
+            print(self.schema.treeString())
 
+    @functools.cache
     def inputFiles(self) -> List[str]:
         query = self._plan.to_proto(self._session.client)
         result = self._session.client._analyze(method="input_files", plan=query).input_files
@@ -1821,17 +1899,19 @@ class DataFrame(ParentDataFrame):
 
     def to(self, schema: StructType) -> ParentDataFrame:
         assert schema is not None
-        return DataFrame(
+        res = DataFrame(
             plan.ToSchema(child=self._plan, schema=schema),
             session=self._session,
         )
+        res._cached_schema = schema
+        return res
 
     def toDF(self, *cols: str) -> ParentDataFrame:
         for col_ in cols:
             if not isinstance(col_, str):
                 raise PySparkTypeError(
-                    error_class="NOT_LIST_OF_STR",
-                    message_parameters={"arg_name": "cols", "arg_type": type(col_).__name__},
+                    errorClass="NOT_LIST_OF_STR",
+                    messageParameters={"arg_name": "cols", "arg_type": type(col_).__name__},
                 )
         return DataFrame(plan.ToDF(self._plan, list(cols)), self._session)
 
@@ -1849,8 +1929,8 @@ class DataFrame(ParentDataFrame):
     ) -> str:
         if extended is not None and mode is not None:
             raise PySparkValueError(
-                error_class="CANNOT_SET_TOGETHER",
-                message_parameters={"arg_list": "extended and mode"},
+                errorClass="CANNOT_SET_TOGETHER",
+                messageParameters={"arg_list": "extended and mode"},
             )
 
         # For the no argument case: df.explain()
@@ -1872,8 +1952,8 @@ class DataFrame(ParentDataFrame):
         if not (is_no_argument or is_extended_case or is_extended_as_mode or is_mode_case):
             argtypes = [str(type(arg)) for arg in [extended, mode] if arg is not None]
             raise PySparkTypeError(
-                error_class="NOT_BOOL_OR_STR",
-                message_parameters={
+                errorClass="NOT_BOOL_OR_STR",
+                messageParameters={
                     "arg_name": "extended (optional) and mode (optional)",
                     "arg_type": ", ".join(argtypes),
                 },
@@ -1901,25 +1981,29 @@ class DataFrame(ParentDataFrame):
         command = plan.CreateView(
             child=self._plan, name=name, is_global=False, replace=False
         ).command(session=self._session.client)
-        self._session.client.execute_command(command, self._plan.observations)
+        _, _, ei = self._session.client.execute_command(command, self._plan.observations)
+        self._execution_info = ei
 
     def createOrReplaceTempView(self, name: str) -> None:
         command = plan.CreateView(
             child=self._plan, name=name, is_global=False, replace=True
         ).command(session=self._session.client)
-        self._session.client.execute_command(command, self._plan.observations)
+        _, _, ei = self._session.client.execute_command(command, self._plan.observations)
+        self._execution_info = ei
 
     def createGlobalTempView(self, name: str) -> None:
         command = plan.CreateView(
             child=self._plan, name=name, is_global=True, replace=False
         ).command(session=self._session.client)
-        self._session.client.execute_command(command, self._plan.observations)
+        _, _, ei = self._session.client.execute_command(command, self._plan.observations)
+        self._execution_info = ei
 
     def createOrReplaceGlobalTempView(self, name: str) -> None:
         command = plan.CreateView(
             child=self._plan, name=name, is_global=True, replace=True
         ).command(session=self._session.client)
-        self._session.client.execute_command(command, self._plan.observations)
+        _, _, ei = self._session.client.execute_command(command, self._plan.observations)
+        self._execution_info = ei
 
     def cache(self) -> ParentDataFrame:
         return self.persist()
@@ -2005,7 +2089,7 @@ class DataFrame(ParentDataFrame):
             evalType=evalType,
         )
 
-        return DataFrame(
+        res = DataFrame(
             plan.MapPartitions(
                 child=self._plan,
                 function=udf_obj,
@@ -2015,6 +2099,9 @@ class DataFrame(ParentDataFrame):
             ),
             session=self._session,
         )
+        if isinstance(schema, StructType):
+            res._cached_schema = schema
+        return res
 
     def mapInPandas(
         self,
@@ -2075,8 +2162,8 @@ class DataFrame(ParentDataFrame):
     def sameSemantics(self, other: ParentDataFrame) -> bool:
         if not isinstance(other, DataFrame):
             raise PySparkTypeError(
-                error_class="NOT_DATAFRAME",
-                message_parameters={"arg_name": "other", "arg_type": type(other).__name__},
+                errorClass="NOT_DATAFRAME",
+                messageParameters={"arg_name": "other", "arg_type": type(other).__name__},
             )
         self._check_same_session(other)
         return self._session.client.same_semantics(
@@ -2084,43 +2171,67 @@ class DataFrame(ParentDataFrame):
             other=other._plan.to_proto(other._session.client),
         )
 
+    @functools.cache
     def semanticHash(self) -> int:
         return self._session.client.semantic_hash(
             plan=self._plan.to_proto(self._session.client),
         )
 
     def writeTo(self, table: str) -> "DataFrameWriterV2":
-        return DataFrameWriterV2(self._plan, self._session, table)
+        def cb(ei: "ExecutionInfo") -> None:
+            self._execution_info = ei
+
+        return DataFrameWriterV2(self._plan, self._session, table, cb)
+
+    def mergeInto(self, table: str, condition: Column) -> MergeIntoWriter:
+        def cb(ei: "ExecutionInfo") -> None:
+            self._execution_info = ei
+
+        return MergeIntoWriter(
+            self._plan, self._session, table, condition, cb  # type: ignore[arg-type]
+        )
 
     def offset(self, n: int) -> ParentDataFrame:
         return DataFrame(plan.Offset(child=self._plan, offset=n), session=self._session)
 
+    def checkpoint(self, eager: bool = True) -> "DataFrame":
+        cmd = plan.Checkpoint(child=self._plan, local=False, eager=eager)
+        _, properties, self._execution_info = self._session.client.execute_command(
+            cmd.command(self._session.client)
+        )
+        assert "checkpoint_command_result" in properties
+        checkpointed = properties["checkpoint_command_result"]
+        assert isinstance(checkpointed._plan, plan.CachedRemoteRelation)
+        return checkpointed
+
+    def localCheckpoint(self, eager: bool = True) -> "DataFrame":
+        cmd = plan.Checkpoint(child=self._plan, local=True, eager=eager)
+        _, properties, self._execution_info = self._session.client.execute_command(
+            cmd.command(self._session.client)
+        )
+        assert "checkpoint_command_result" in properties
+        checkpointed = properties["checkpoint_command_result"]
+        assert isinstance(checkpointed._plan, plan.CachedRemoteRelation)
+        return checkpointed
+
     if not is_remote_only():
-
-        def checkpoint(self, eager: bool = True) -> "DataFrame":
-            raise PySparkNotImplementedError(
-                error_class="NOT_IMPLEMENTED",
-                message_parameters={"feature": "checkpoint()"},
-            )
-
-        def localCheckpoint(self, eager: bool = True) -> "DataFrame":
-            raise PySparkNotImplementedError(
-                error_class="NOT_IMPLEMENTED",
-                message_parameters={"feature": "localCheckpoint()"},
-            )
 
         def toJSON(self, use_unicode: bool = True) -> "RDD[str]":
             raise PySparkNotImplementedError(
-                error_class="NOT_IMPLEMENTED",
-                message_parameters={"feature": "toJSON()"},
+                errorClass="NOT_IMPLEMENTED",
+                messageParameters={"feature": "toJSON()"},
             )
 
         @property
         def rdd(self) -> "RDD[Row]":
             raise PySparkNotImplementedError(
-                error_class="NOT_IMPLEMENTED",
-                message_parameters={"feature": "rdd"},
+                errorClass="NOT_IMPLEMENTED",
+                messageParameters={"feature": "rdd"},
             )
+
+    @property
+    def executionInfo(self) -> Optional["ExecutionInfo"]:
+        return self._execution_info
 
 
 class DataFrameNaFunctions(ParentDataFrameNaFunctions):
@@ -2202,8 +2313,6 @@ def _test() -> None:
     if not is_remote_only():
         del pyspark.sql.dataframe.DataFrame.toJSON.__doc__
         del pyspark.sql.dataframe.DataFrame.rdd.__doc__
-        del pyspark.sql.dataframe.DataFrame.checkpoint.__doc__
-        del pyspark.sql.dataframe.DataFrame.localCheckpoint.__doc__
 
     globs["spark"] = (
         PySparkSession.builder.appName("sql.connect.dataframe tests")

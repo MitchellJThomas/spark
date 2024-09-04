@@ -27,10 +27,10 @@ import org.apache.spark.sql.types._
 import org.apache.spark.tags.DockerTest
 
 /**
- * To run this test suite for a specific version (e.g., 2019-CU13-ubuntu-20.04):
+ * To run this test suite for a specific version (e.g., 2022-CU14-ubuntu-22.04):
  * {{{
  *   ENABLE_DOCKER_INTEGRATION_TESTS=1
- *   MSSQLSERVER_DOCKER_IMAGE_NAME=mcr.microsoft.com/mssql/server:2019-CU13-ubuntu-20.04
+ *   MSSQLSERVER_DOCKER_IMAGE_NAME=mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04
  *     ./build/sbt -Pdocker-integration-tests "testOnly *v2*MsSqlServerIntegrationSuite"
  * }}}
  */
@@ -70,6 +70,12 @@ class MsSqlServerIntegrationSuite extends DockerJDBCIntegrationV2Suite with V2JD
     connection.prepareStatement(
       "CREATE TABLE employee (dept INT, name VARCHAR(32), salary NUMERIC(20, 2), bonus FLOAT)")
       .executeUpdate()
+    connection.prepareStatement(
+      s"""CREATE TABLE pattern_testing_table (
+         |pattern_testing_col VARCHAR(50)
+         |)
+                   """.stripMargin
+    ).executeUpdate()
   }
 
   override def notSupportsTableComment: Boolean = true
