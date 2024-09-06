@@ -37,7 +37,7 @@ import org.apache.spark.sql.connect.common.{DataTypeProtoConverter, StorageLevel
 import org.apache.spark.sql.errors.DataTypeErrors.toSQLId
 import org.apache.spark.sql.expressions.SparkUserDefinedFunction
 import org.apache.spark.sql.functions.{struct, to_json}
-import org.apache.spark.sql.internal.{ColumnNodeToProtoConverter, DataFrameWriterImpl, ToScalaUDF, UDFAdaptors, UnresolvedAttribute, UnresolvedRegex}
+import org.apache.spark.sql.internal.{ColumnNodeToProtoConverter, DataFrameWriterImpl, DataFrameWriterV2Impl, MergeIntoWriterImpl, ToScalaUDF, UDFAdaptors, UnresolvedAttribute, UnresolvedRegex}
 import org.apache.spark.sql.streaming.DataStreamWriter
 import org.apache.spark.sql.types.{Metadata, StructType}
 import org.apache.spark.storage.StorageLevel
@@ -1018,51 +1018,12 @@ class Dataset[T] private[sql] (
     new DataFrameWriterImpl[T](this)
   }
 
-  /**
-   * Create a write configuration builder for v2 sources.
-   *
-   * This builder is used to configure and execute write operations. For example, to append to an
-   * existing table, run:
-   *
-   * {{{
-   *   df.writeTo("catalog.db.table").append()
-   * }}}
-   *
-   * This can also be used to create or replace existing tables:
-   *
-   * {{{
-   *   df.writeTo("catalog.db.table").partitionedBy($"col").createOrReplace()
-   * }}}
-   *
-   * @group basic
-   * @since 3.4.0
-   */
+  /** @inheritdoc */
   def writeTo(table: String): DataFrameWriterV2[T] = {
-    new DataFrameWriterV2[T](table, this)
+    new DataFrameWriterV2Impl[T](table, this)
   }
 
-  /**
-   * Merges a set of updates, insertions, and deletions based on a source table into a target
-   * table.
-   *
-   * Scala Examples:
-   * {{{
-   *   spark.table("source")
-   *     .mergeInto("target", $"source.id" === $"target.id")
-   *     .whenMatched($"salary" === 100)
-   *     .delete()
-   *     .whenNotMatched()
-   *     .insertAll()
-   *     .whenNotMatchedBySource($"salary" === 100)
-   *     .update(Map(
-   *       "salary" -> lit(200)
-   *     ))
-   *     .merge()
-   * }}}
-   *
-   * @group basic
-   * @since 4.0.0
-   */
+  /** @inheritdoc */
   def mergeInto(table: String, condition: Column): MergeIntoWriter[T] = {
     if (isStreaming) {
       throw new AnalysisException(
@@ -1070,7 +1031,7 @@ class Dataset[T] private[sql] (
         messageParameters = Map("methodName" -> toSQLId("mergeInto")))
     }
 
-    new MergeIntoWriter[T](table, this, condition)
+    new MergeIntoWriterImpl[T](table, this, condition)
   }
 
   /**
