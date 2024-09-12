@@ -982,6 +982,22 @@ class Dataset[T] private[sql](
     unpivot(ids.toArray, variableColumnName, valueColumnName)
 
   /** @inheritdoc */
+  def transpose(indexColumn: Column): DataFrame = withPlan {
+    UnresolvedTranspose(
+      Seq(indexColumn.named),
+      logicalPlan
+    )
+  }
+
+  /** @inheritdoc */
+  def transpose(): DataFrame = withPlan {
+    UnresolvedTranspose(
+      Seq.empty,
+      logicalPlan
+    )
+  }
+
+  /** @inheritdoc */
   @scala.annotation.varargs
   def observe(name: String, expr: Column, exprs: Column*): Dataset[T] = withTypedPlan {
     CollectMetrics(name, (expr +: exprs).map(_.named), logicalPlan, id)
@@ -1993,14 +2009,6 @@ class Dataset[T] private[sql](
   ////////////////////////////////////////////////////////////////////////////
   // For Python API
   ////////////////////////////////////////////////////////////////////////////
-
-  /**
-   * It adds a new long column with the name `name` that increases one by one.
-   * This is for 'distributed-sequence' default index in pandas API on Spark.
-   */
-  private[sql] def withSequenceColumn(name: String) = {
-    select(column(DistributedSequenceID()).alias(name), col("*"))
-  }
 
   /**
    * Converts a JavaRDD to a PythonRDD.
