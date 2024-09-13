@@ -103,7 +103,7 @@ spark3-submit run-example --deploy-mode=cluster JavaTC 100 &
 # Requires you have https://github.com/apache/spark.git cloned and you are in the spark directory
 # So that the examples/src/main/resources/kv1.txt is availale
 # Note this is a --deploy-mode="client"
-pushd spark-3.5.1
+pushd spark-$spark_version
 spark3-submit run-example --deploy-mode=client sql.hive.SparkHiveExample
 popd
 
@@ -113,6 +113,6 @@ popd
 #  pstree
 # Also use systemctl to see this relationship as well
 #  systemctl status
-pushd spark-3.5.1
+pushd spark-$spark_version
 spark3-submit --deploy-mode=cluster  examples/src/main/python/pi.py 100 &
 spark3-submit --deploy-mode=cluster  examples/src/main/python/transitive_closure.py 20 &
