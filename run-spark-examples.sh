@@ -5,7 +5,8 @@
 # Add the data required for the jobs (otherwise they fail)
 #  hdfs://obs-mthomas-de-master0.obs-mtho.xcu2-8y8x.dev.cldr.work:8020/user/csso_mthomas/data/mllib/als/sample_movielens_ratings.txt
 kinit
-spark_version="3.5.1"
+
+spark_version="3.5.2"
 spark_tar="v${spark_version}.tar.gz"
 if [ ! -f $spark_tar  ]; then
   wget https://github.com/apache/spark/archive/refs/tags/$spark_tar
