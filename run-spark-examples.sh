@@ -4,7 +4,12 @@
 #  java.io.IOException: There is no mapped role for the group(s) associated with the authenticated user. (user: csso_mthomas)"
 # Add the data required for the jobs (otherwise they fail)
 #  hdfs://obs-mthomas-de-master0.obs-mtho.xcu2-8y8x.dev.cldr.work:8020/user/csso_mthomas/data/mllib/als/sample_movielens_ratings.txt
-kinit
+echo "Checking Kerberos token"
+klist
+while [[ $? -eq 1 ]]; do
+    echo "Running kinit to create a Kerberos token"
+    kinit
+done
 
 spark_version="3.5.2"
 spark_tar="v${spark_version}.tar.gz"
